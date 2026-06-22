@@ -1,25 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Upper Limit Stock Screener for Korean Market (KOSPI/KOSDAQ)
-Run: streamlit run upper_limit_screener.py
+Upper Limit Stock Screener - Yahoo Finance + curl_cffi version
+Run: streamlit run stockbot.py
 """
-
-import ssl
-import urllib3
-ssl._create_default_https_context = ssl._create_unverified_context
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-try:
-    import requests
-    from requests.adapters import HTTPAdapter
-    _old_merge = requests.Session.merge_environment_settings
-    def _merge_no_verify(self, url, proxies, stream, verify, cert):
-        s = _old_merge(self, url, proxies, stream, verify, cert)
-        s['verify'] = False
-        return s
-    requests.Session.merge_environment_settings = _merge_no_verify
-except Exception:
-    pass
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -30,19 +13,20 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
+import json
 import time
 
 try:
-    from pykrx import stock as pykrx_stock
+    import curl_cffi.requests as cf_requests
 except ImportError:
-    st.error("pykrx not installed: pip install pykrx")
+    st.error("curl_cffi 미설치: pip install curl_cffi")
     st.stop()
 
 # ================================================================
 # PAGE CONFIG & CSS
 # ================================================================
 st.set_page_config(
-    page_title="Upper Limit Screener",
+    page_title="상한가 스크리너",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -108,152 +92,141 @@ html, body, [data-testid="stAppViewContainer"] {
 """, unsafe_allow_html=True)
 
 # ================================================================
-# DATE HELPERS
+# KOSPI/KOSDAQ 주요 종목 리스트 (티커: 종목명)
 # ================================================================
 
-def get_trading_date(offset=0):
-    today = datetime.now()
-    if today.hour < 15 or (today.hour == 15 and today.minute < 30):
-        today -= timedelta(days=1)
-    date = today + timedelta(days=offset)
-    while date.weekday() >= 5:
-        date -= timedelta(days=1)
-    return date.strftime("%Y%m%d")
+KOSPI_TICKERS = {
+    "005930.KS": "삼성전자", "000660.KS": "SK하이닉스", "207940.KS": "삼성바이오로직스",
+    "005380.KS": "현대차", "000270.KS": "기아", "051910.KS": "LG화학",
+    "035420.KS": "NAVER", "035720.KS": "카카오", "028260.KS": "삼성물산",
+    "068270.KS": "셀트리온", "105560.KS": "KB금융", "055550.KS": "신한지주",
+    "012330.KS": "현대모비스", "066570.KS": "LG전자", "032830.KS": "삼성생명",
+    "096770.KS": "SK이노베이션", "003550.KS": "LG", "017670.KS": "SK텔레콤",
+    "030200.KS": "KT", "011200.KS": "HMM", "009540.KS": "HD한국조선해양",
+    "042660.KS": "한화오션", "010130.KS": "고려아연", "011790.KS": "SKC",
+    "001040.KS": "CJ", "097950.KS": "CJ제일제당", "000810.KS": "삼성화재",
+    "086790.KS": "하나금융지주", "316140.KS": "우리금융지주", "024110.KS": "기업은행",
+    "018260.KS": "삼성에스디에스", "009150.KS": "삼성전기", "006400.KS": "삼성SDI",
+    "051900.KS": "LG생활건강", "161390.KS": "한국타이어앤테크놀로지", "047050.KS": "포스코인터내셔널",
+    "003490.KS": "대한항공", "020150.KS": "율촌화학", "000720.KS": "현대건설",
+    "004020.KS": "현대제철", "005940.KS": "NH투자증권", "071050.KS": "한국금융지주",
+    "016360.KS": "삼성증권", "139480.KS": "이마트", "069960.KS": "현대백화점",
+    "004990.KS": "롯데지주", "023530.KS": "롯데쇼핑", "011170.KS": "롯데케미칼",
+}
 
+KOSDAQ_TICKERS = {
+    "247540.KQ": "에코프로비엠", "086520.KQ": "에코프로", "373220.KQ": "LG에너지솔루션",
+    "196170.KQ": "알테오젠", "263750.KQ": "펄어비스", "293490.KQ": "카카오게임즈",
+    "112040.KQ": "위메이드", "095340.KQ": "ISC", "214150.KQ": "클래시스",
+    "145020.KQ": "휴젤", "141080.KQ": "레고켐바이오", "226490.KQ": "에이치엘비생명과학",
+    "182360.KQ": "큐리언트", "950200.KQ": "파나진", "091990.KQ": "셀트리온헬스케어",
+    "036930.KQ": "주성엔지니어링", "357780.KQ": "솔브레인", "039030.KQ": "이오테크닉스",
+    "109610.KQ": "에스씨아이평가정보", "053800.KQ": "안랩", "078600.KQ": "대주전자재료",
+    "950130.KQ": "엑세스바이오", "302430.KQ": "이노뎁", "048410.KQ": "현대바이오",
+    "028300.KQ": "HLB", "064550.KQ": "바이오니아", "013360.KQ": "일진머티리얼즈",
+    "040350.KQ": "크레버스", "206560.KQ": "덱스터", "900290.KQ": "GRT",
+    "041510.KQ": "에스엠", "035900.KQ": "JYP Ent.", "122870.KQ": "와이지엔터테인먼트",
+    "058970.KQ": "엠플러스", "123690.KQ": "한국화장품제조", "214370.KQ": "케어젠",
+    "005290.KQ": "동진쎄미켐", "222080.KQ": "씨아이에스", "066970.KQ": "엘앤에프",
+    "347700.KQ": "스피어", "031980.KQ": "피에스케이홀딩스", "336570.KQ": "원익QnC",
+    "900310.KQ": "컬러레이", "060370.KQ": "LS마린솔루션", "099430.KQ": "바이오플러스",
+    "096530.KQ": "씨젠", "048530.KQ": "대한과학", "950160.KQ": "코오롱티슈진",
+    "140410.KQ": "메지온", "237690.KQ": "에스티팜",
+}
 
-def business_days_ago(n):
-    base = datetime.strptime(get_trading_date(), "%Y%m%d")
-    count = 0
-    cur = base
-    while count < n:
-        cur -= timedelta(days=1)
-        if cur.weekday() < 5:
-            count += 1
-    return cur.strftime("%Y%m%d")
+ALL_TICKERS = {**KOSPI_TICKERS, **KOSDAQ_TICKERS}
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
+}
 
 # ================================================================
-# DATA FETCHING
+# 데이터 수집 함수
 # ================================================================
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_market_tickers(market="ALL"):
-    date = get_trading_date()
-    dfs = []
-    markets = ["KOSPI", "KOSDAQ"] if market == "ALL" else [market]
-    for mkt in markets:
-        try:
-            df = pykrx_stock.get_market_ohlcv_by_ticker(date, market=mkt)
-            
-            # 컬럼명 자동 정규화 (버전별 차이 대응)
-            col_list = list(df.columns)
-            rename_map = {}
-            keywords = {
-                "시가": "시가", "고가": "고가", "저가": "저가",
-                "종가": "종가", "거래량": "거래량",
-            }
-            for col in col_list:
-                for kw, target in keywords.items():
-                    if kw in col:
-                        rename_map[col] = target
-            df.rename(columns=rename_map, inplace=True)
-
-            # 시가총액/거래대금 별도 수집
-            cap_df = pykrx_stock.get_market_cap_by_ticker(date, market=mkt)
-            
-            # 거래대금 컬럼 찾기
-            td_col = None
-            for c in cap_df.columns:
-                if "거래대금" in c:
-                    td_col = c
-                    break
-            cap_col = None
-            for c in cap_df.columns:
-                if "시가총액" in c:
-                    cap_col = c
-                    break
-
-            if td_col and cap_col:
-                df = df.join(cap_df[[cap_col, td_col]], how="left")
-                df.rename(columns={cap_col: "시가총액", td_col: "거래대금"}, inplace=True)
-            elif cap_col:
-                df = df.join(cap_df[[cap_col]], how="left")
-                df.rename(columns={cap_col: "시가총액"}, inplace=True)
-                df["거래대금"] = 0
-
-            # 필수 컬럼 없으면 0으로 채움
-            for col in ["시가", "고가", "저가", "종가", "거래량", "시가총액", "거래대금"]:
-                if col not in df.columns:
-                    df[col] = 0
-
-            df["시장"] = mkt
-            names_fn = pykrx_stock.get_market_ticker_name
-            df["종목명"] = [names_fn(t) for t in df.index]
-            dfs.append(df)
-
-        except Exception as e:
-            st.warning(f"{mkt} data fetch failed: {e}")
-
-    if not dfs:
-        return pd.DataFrame()
-
-    result = pd.concat(dfs)
-    result.index.name = "티커"
-    result.reset_index(inplace=True)
-    return result
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_ohlcv_history(ticker, days=70):
-    end = get_trading_date()
-    start = business_days_ago(days + 10)
+def fetch_quote(ticker: str) -> dict:
+    """야후 파이낸스에서 현재 시세 가져오기"""
+    url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
+    params = {"interval": "1d", "range": "1d"}
     try:
-        df = pykrx_stock.get_market_ohlcv_by_date(start, end, ticker)
-        df.index = pd.to_datetime(df.index)
-        df.columns = ["시가", "고가", "저가", "종가", "거래량", "거래대금", "등락률"]
+        resp = cf_requests.get(url, params=params, headers=HEADERS, verify=False, timeout=10)
+        if resp.status_code != 200:
+            return {}
+        data = resp.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return {}
+        meta = result[0].get("meta", {})
+        return {
+            "ticker":        ticker,
+            "name":          ALL_TICKERS.get(ticker, ticker),
+            "price":         meta.get("regularMarketPrice", 0),
+            "open":          meta.get("chartPreviousClose", 0),
+            "prev_close":    meta.get("chartPreviousClose", 0),
+            "day_high":      meta.get("regularMarketDayHigh", 0),
+            "day_low":       meta.get("regularMarketDayLow", 0),
+            "volume":        meta.get("regularMarketVolume", 0),
+            "market_cap":    meta.get("marketCap", 0),
+            "market":        "KOSPI" if ticker.endswith(".KS") else "KOSDAQ",
+        }
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_history(ticker: str, days: int = 70) -> pd.DataFrame:
+    """야후 파이낸스에서 OHLCV 히스토리 가져오기"""
+    url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
+    params = {"interval": "1d", "range": "4mo"}
+    try:
+        resp = cf_requests.get(url, params=params, headers=HEADERS, verify=False, timeout=10)
+        if resp.status_code != 200:
+            return pd.DataFrame()
+        data = resp.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return pd.DataFrame()
+
+        timestamps = result[0].get("timestamp", [])
+        ohlcv = result[0].get("indicators", {}).get("quote", [{}])[0]
+
+        df = pd.DataFrame({
+            "날짜":   pd.to_datetime(timestamps, unit="s").tz_localize("UTC").tz_convert("Asia/Seoul").tz_localize(None),
+            "시가":   ohlcv.get("open", []),
+            "고가":   ohlcv.get("high", []),
+            "저가":   ohlcv.get("low", []),
+            "종가":   ohlcv.get("close", []),
+            "거래량": ohlcv.get("volume", []),
+        })
+        df.set_index("날짜", inplace=True)
+        df.dropna(inplace=True)
         return df.tail(days)
     except Exception:
         return pd.DataFrame()
 
 # ================================================================
-# TECHNICAL INDICATORS
+# 기술지표 계산
 # ================================================================
 
-def compute_indicators(df):
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for w in [5, 20, 60, 120, 240]:
         df[f"MA{w}"] = df["종가"].rolling(w).mean()
-    df["BB_mid"]   = df["종가"].rolling(20).mean()
-    df["BB_std"]   = df["종가"].rolling(20).std()
-    df["BB_upper"] = df["BB_mid"] + 2 * df["BB_std"]
-    df["BB_lower"] = df["BB_mid"] - 2 * df["BB_std"]
-    df["Vol_MA20"] = df["거래량"].rolling(20).mean()
-    df["Vol_MAX60"]= df["거래량"].rolling(60).max()
+    df["BB_mid"]    = df["종가"].rolling(20).mean()
+    df["BB_std"]    = df["종가"].rolling(20).std()
+    df["BB_upper"]  = df["BB_mid"] + 2 * df["BB_std"]
+    df["BB_lower"]  = df["BB_mid"] - 2 * df["BB_std"]
+    df["Vol_MA20"]  = df["거래량"].rolling(20).mean()
+    df["Vol_MAX60"] = df["거래량"].rolling(60).max()
     return df
 
-
-def get_vwap_support(df, window=20):
-    recent = df.tail(window).copy()
-    if recent.empty or recent["거래량"].sum() == 0:
-        return 0.0
-    mid = (recent["고가"] + recent["저가"]) / 2
-    return (mid * recent["거래량"]).sum() / recent["거래량"].sum()
-
 # ================================================================
-# SCORE ALGORITHM
+# 상한가 점수 알고리즘
 # ================================================================
 
-def compute_score(row, hist):
-    """
-    Score breakdown (0-100):
-      Volume surge (>=500% of MA20)  : 25
-      All-time 60d volume break       :  5
-      Change rate (+10%~+22%)         : 15
-      VWAP breakout                   : 10
-      MA alignment (5>20>60)          : 15
-      Bollinger upper breakout        : 10
-      Gap from high (<=3%)            : 10
-      Turnover >= 100B KRW            :  5
-      Early session bonus             :  5
-    """
+def compute_score(quote: dict, hist: pd.DataFrame) -> dict:
     scores = {
         "거래량급증":   0,
         "역대급거래량": 0,
@@ -262,7 +235,7 @@ def compute_score(row, hist):
         "정배열":       0,
         "볼린저돌파":   0,
         "고가이격":     0,
-        "거래대금":     0,
+        "시가총액":     0,
         "장초반보너스": 0,
     }
 
@@ -272,169 +245,164 @@ def compute_score(row, hist):
     hist = compute_indicators(hist)
     last = hist.iloc[-1]
 
-    cur_price  = row.get("종가",     last["종가"])
-    open_price = row.get("시가",     last["시가"])
-    high_price = row.get("고가",     last["고가"])
-    vol_today  = row.get("거래량",   last["거래량"])
-    turnover   = row.get("거래대금", 0)
+    cur   = quote.get("price", 0)
+    open_ = quote.get("open", 0)
+    high  = quote.get("day_high", 0)
+    vol   = quote.get("volume", 0)
+    mcap  = quote.get("market_cap", 0)
 
-    vol_ma20  = last["Vol_MA20"]  if not pd.isna(last["Vol_MA20"])  else 1
-    vol_max60 = last["Vol_MAX60"] if not pd.isna(last["Vol_MAX60"]) else 1
+    vol_ma20  = float(last.get("Vol_MA20",  1) or 1)
+    vol_max60 = float(last.get("Vol_MAX60", 1) or 1)
 
-    # Volume surge
+    # 거래량 급증
     if vol_ma20 > 0:
-        vr = vol_today / vol_ma20
+        vr = vol / vol_ma20
         if   vr >= 20: scores["거래량급증"] = 25
         elif vr >= 10: scores["거래량급증"] = 20
         elif vr >= 7:  scores["거래량급증"] = 15
         elif vr >= 5:  scores["거래량급증"] = 10
         elif vr >= 3:  scores["거래량급증"] = 5
 
-    # All-time 60d volume
-    if vol_today >= vol_max60:
+    # 60일 최고 거래량 돌파
+    if vol >= vol_max60:
         scores["역대급거래량"] = 5
 
-    # Change rate
-    if open_price > 0:
-        chg = (cur_price - open_price) / open_price * 100
+    # 등락률 +10% ~ +22%
+    if open_ > 0:
+        chg = (cur - open_) / open_ * 100
         if   18 <= chg <= 22: scores["등락률"] = 15
         elif 15 <= chg < 18:  scores["등락률"] = 12
         elif 12 <= chg < 15:  scores["등락률"] = 10
         elif 10 <= chg < 12:  scores["등락률"] = 7
 
-    # VWAP breakout
-    support = get_vwap_support(hist, window=20)
-    if support > 0 and cur_price > support * 1.01:
-        over = (cur_price - support) / support * 100
-        if   over >= 10: scores["매물대돌파"] = 10
-        elif over >= 5:  scores["매물대돌파"] = 7
-        elif over >= 1:  scores["매물대돌파"] = 4
+    # 매물대(VWAP) 돌파
+    recent = hist.tail(20)
+    if not recent.empty and recent["거래량"].sum() > 0:
+        mid = (recent["고가"] + recent["저가"]) / 2
+        vwap = (mid * recent["거래량"]).sum() / recent["거래량"].sum()
+        if cur > vwap * 1.01:
+            over = (cur - vwap) / vwap * 100
+            if   over >= 10: scores["매물대돌파"] = 10
+            elif over >= 5:  scores["매물대돌파"] = 7
+            elif over >= 1:  scores["매물대돌파"] = 4
 
-    # MA alignment
-    ma5  = last.get("MA5",  np.nan)
-    ma20 = last.get("MA20", np.nan)
-    ma60 = last.get("MA60", np.nan)
-    ma120= last.get("MA120",np.nan)
-    ma240= last.get("MA240",np.nan)
+    # 이동평균 정배열
+    ma5   = float(last.get("MA5",  0) or 0)
+    ma20  = float(last.get("MA20", 0) or 0)
+    ma60  = float(last.get("MA60", 0) or 0)
+    ma120 = float(last.get("MA120",0) or 0)
+    ma240 = float(last.get("MA240",0) or 0)
 
     a = 0
-    if not any(pd.isna(v) for v in [ma5, ma20, ma60]):
-        if ma5 > ma20 > ma60:
-            a += 8
-    if not pd.isna(ma120) and cur_price > ma120: a += 4
-    if not pd.isna(ma240) and cur_price > ma240: a += 3
+    if ma5 > 0 and ma20 > 0 and ma60 > 0 and ma5 > ma20 > ma60:
+        a += 8
+    if ma120 > 0 and cur > ma120: a += 4
+    if ma240 > 0 and cur > ma240: a += 3
     scores["정배열"] = min(a, 15)
 
-    # Bollinger upper
-    bb_up = last.get("BB_upper", np.nan)
-    if not pd.isna(bb_up) and bb_up > 0:
-        if cur_price >= bb_up * 1.01: scores["볼린저돌파"] = 10
-        elif cur_price >= bb_up:       scores["볼린저돌파"] = 6
+    # 볼린저 밴드 상단 돌파
+    bb_up = float(last.get("BB_upper", 0) or 0)
+    if bb_up > 0:
+        if cur >= bb_up * 1.01: scores["볼린저돌파"] = 10
+        elif cur >= bb_up:       scores["볼린저돌파"] = 6
 
-    # Gap from high
-    if high_price > 0:
-        gap = (high_price - cur_price) / high_price * 100
+    # 고가 대비 현재가 이격
+    if high > 0:
+        gap = (high - cur) / high * 100
         if   gap <= 0.5: scores["고가이격"] = 10
         elif gap <= 1.5: scores["고가이격"] = 7
         elif gap <= 3.0: scores["고가이격"] = 4
 
-    # Turnover
-    if turnover >= 10_000_000_000: scores["거래대금"] = 5
-    elif turnover >= 5_000_000_000: scores["거래대금"] = 2
+    # 시가총액 500억~5000억
+    if 50_000_000_000 <= mcap <= 500_000_000_000:
+        scores["시가총액"] = 5
+    elif mcap > 0:
+        scores["시가총액"] = 2
 
-    # Early session bonus (09:00 ~ 10:30)
+    # 장 초반 보너스
     now = datetime.now()
     if (now.hour == 9) or (now.hour == 10 and now.minute <= 30):
         if scores["거래량급증"] >= 10:
             scores["장초반보너스"] = 5
 
-    scores["합계"] = min(sum(scores.values()), 100)
+    scores["합계"] = min(sum(v for k, v in scores.items() if k != "합계"), 100)
     return scores
 
 # ================================================================
-# SCREENING
+# 스크리닝
 # ================================================================
 
-def screen_stocks(market="ALL", min_cap=50_000_000_000,
-                  max_cap=500_000_000_000, min_turnover=10_000_000_000,
-                  progress_bar=None, status_text=None):
-
-    all_tickers = fetch_market_tickers(market)
-    if all_tickers.empty:
-        return pd.DataFrame()
-
-    filtered = all_tickers[
-        (all_tickers["시가총액"] >= min_cap) &
-        (all_tickers["시가총액"] <= max_cap) &
-        (all_tickers["거래대금"] >= min_turnover) &
-        (all_tickers["종가"]     > 0)
-    ].copy()
-
-    if filtered.empty:
-        return pd.DataFrame()
+def screen_stocks(market="ALL", progress_bar=None, status_text=None):
+    if market == "KOSPI":
+        tickers = KOSPI_TICKERS
+    elif market == "KOSDAQ":
+        tickers = KOSDAQ_TICKERS
+    else:
+        tickers = ALL_TICKERS
 
     results = []
-    total = len(filtered)
+    total = len(tickers)
 
-    for i, (_, row) in enumerate(filtered.iterrows()):
-        ticker = row["티커"]
-        name   = row["종목명"]
-
+    for i, (ticker, name) in enumerate(tickers.items()):
         if progress_bar:
             progress_bar.progress((i + 1) / total)
         if status_text:
-            status_text.text(f"Analyzing: {name} ({i+1}/{total})")
+            status_text.text(f"분석 중: {name} ({i+1}/{total})")
 
-        hist = fetch_ohlcv_history(ticker, days=70)
-        if hist.empty or len(hist) < 20:
+        quote = fetch_quote(ticker)
+        if not quote:
             continue
 
-        open_p  = row["시가"]
-        close_p = row["종가"]
-        if open_p <= 0:
+        cur   = quote.get("price", 0)
+        open_ = quote.get("open", 0)
+        if cur <= 0 or open_ <= 0:
             continue
-        chg = (close_p - open_p) / open_p * 100
+
+        chg = (cur - open_) / open_ * 100
         if not (10 <= chg <= 22):
             continue
 
-        score_dict = compute_score(row, hist)
-        total_score = score_dict["합계"]
+        hist = fetch_history(ticker, days=70)
+        if hist.empty or len(hist) < 20:
+            continue
 
+        score_dict = compute_score(quote, hist)
         hist_ind = compute_indicators(hist)
         last = hist_ind.iloc[-1]
+
+        vol_ma20 = float(last.get("Vol_MA20", 1) or 1)
 
         results.append({
             "티커":        ticker,
             "종목명":      name,
-            "시장":        row["시장"],
-            "현재가":      int(close_p),
+            "시장":        quote["market"],
+            "현재가":      int(cur),
             "등락률(%)":   round(chg, 2),
-            "거래량":      int(row["거래량"]),
-            "거래대금(억)": round(row["거래대금"] / 1e8, 1),
-            "시가총액(억)": round(row["시가총액"] / 1e8, 0),
-            "상한가점수":  total_score,
+            "거래량":      int(quote.get("volume", 0)),
+            "시가총액(억)": round(quote.get("market_cap", 0) / 1e8, 0),
+            "상한가점수":  score_dict["합계"],
             "_score_detail": score_dict,
             "_ma5":        round(float(last.get("MA5",  0) or 0), 1),
             "_ma20":       round(float(last.get("MA20", 0) or 0), 1),
             "_bb_upper":   round(float(last.get("BB_upper", 0) or 0), 1),
-            "_vol_ma20":   int(last.get("Vol_MA20", 0) or 0),
+            "_vol_ma20":   int(vol_ma20),
         })
-        time.sleep(0.05)
+        time.sleep(0.1)
 
     if not results:
         return pd.DataFrame()
 
-    df_result = pd.DataFrame(results)
-    df_result.sort_values("상한가점수", ascending=False, inplace=True)
-    df_result.reset_index(drop=True, inplace=True)
-    return df_result
+    df = pd.DataFrame(results)
+    df.sort_values("상한가점수", ascending=False, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
 
 # ================================================================
-# CANDLE CHART
+# 캔들 차트
 # ================================================================
 
-def draw_candle_chart(ticker, name):
-    hist = fetch_ohlcv_history(ticker, days=70)
+def draw_candle_chart(ticker: str, name: str) -> go.Figure:
+    hist = fetch_history(ticker, days=70)
     if hist.empty:
         return go.Figure()
 
@@ -449,9 +417,8 @@ def draw_candle_chart(ticker, name):
     )
 
     fig.add_trace(go.Candlestick(
-        x=df.index,
-        open=df["시가"], high=df["고가"], low=df["저가"], close=df["종가"],
-        name="Price",
+        x=df.index, open=df["시가"], high=df["고가"], low=df["저가"], close=df["종가"],
+        name="주가",
         increasing_line_color="#f87171", decreasing_line_color="#60a5fa",
         increasing_fillcolor="#f87171",  decreasing_fillcolor="#60a5fa",
         line=dict(width=1),
@@ -470,11 +437,11 @@ def draw_candle_chart(ticker, name):
 
     if "BB_upper" in df.columns:
         fig.add_trace(go.Scatter(
-            x=df.index, y=df["BB_upper"], name="BB Upper",
+            x=df.index, y=df["BB_upper"], name="BB상단",
             line=dict(color="#f97316", width=1, dash="dash"), opacity=0.6,
         ), row=1, col=1)
         fig.add_trace(go.Scatter(
-            x=df.index, y=df["BB_lower"], name="BB Lower",
+            x=df.index, y=df["BB_lower"], name="BB하단",
             line=dict(color="#f97316", width=1, dash="dash"),
             fill="tonexty", fillcolor="rgba(249,115,22,0.05)", opacity=0.6,
         ), row=1, col=1)
@@ -482,18 +449,18 @@ def draw_candle_chart(ticker, name):
     colors_vol = ["#f87171" if c >= o else "#60a5fa"
                   for c, o in zip(df["종가"], df["시가"])]
     fig.add_trace(go.Bar(
-        x=df.index, y=df["거래량"], name="Volume",
+        x=df.index, y=df["거래량"], name="거래량",
         marker_color=colors_vol, opacity=0.8,
     ), row=2, col=1)
 
     if "Vol_MA20" in df.columns:
         fig.add_trace(go.Scatter(
-            x=df.index, y=df["Vol_MA20"], name="Vol MA20",
+            x=df.index, y=df["Vol_MA20"], name="거래량MA20",
             line=dict(color="#fbbf24", width=1.2, dash="dot"),
         ), row=2, col=1)
 
     fig.update_layout(
-        title=dict(text=f"<b>{name}</b> ({ticker}) — 60-day Chart",
+        title=dict(text=f"<b>{name}</b> ({ticker}) — 60일 차트",
                    font=dict(size=16, color="#e2e8f0")),
         paper_bgcolor="#0a0e1a", plot_bgcolor="#0f1527",
         legend=dict(bgcolor="#111827", bordercolor="#1e2a45",
@@ -507,10 +474,10 @@ def draw_candle_chart(ticker, name):
     return fig
 
 # ================================================================
-# AI OPINION (rule-based, no external API)
+# AI 의견 생성
 # ================================================================
 
-def generate_ai_opinion(row):
+def generate_ai_opinion(row: pd.Series) -> str:
     detail   = row.get("_score_detail", {})
     chg      = row["등락률(%)"]
     vol      = row["거래량"]
@@ -521,21 +488,13 @@ def generate_ai_opinion(row):
 
     lines = []
 
-    # Volume comment
     if detail.get("거래량급증", 0) >= 20:
-        lines.append(
-            f"📊 <strong>거래량 폭발</strong>: 20일 평균 대비 <strong>{vol_ratio}배</strong> 급증 — 강력한 수급 유입 확인."
-        )
+        lines.append(f"📊 <strong>거래량 폭발</strong>: 20일 평균 대비 <strong>{vol_ratio}배</strong> 급증 — 강력한 수급 유입 확인.")
     elif detail.get("거래량급증", 0) >= 10:
-        lines.append(
-            f"📊 거래량이 20일 평균 대비 <strong>{vol_ratio}배</strong> 증가 — 유의미한 매집 신호."
-        )
+        lines.append(f"📊 거래량이 20일 평균 대비 <strong>{vol_ratio}배</strong> 증가 — 유의미한 매집 신호.")
     else:
-        lines.append(
-            f"📊 거래량 20일 평균 대비 <strong>{vol_ratio}배</strong> 수준 — 급증 조건 근접 중."
-        )
+        lines.append(f"📊 거래량 20일 평균 대비 <strong>{vol_ratio}배</strong> 수준 — 급증 조건 근접 중.")
 
-    # Pattern comment
     parts = []
     if detail.get("정배열", 0) >= 8:
         parts.append("5/20/60일 이평선 완전 정배열")
@@ -549,11 +508,8 @@ def generate_ai_opinion(row):
     if parts:
         lines.append(f"📈 <strong>차트 패턴</strong>: {', '.join(parts)} — 추가 상승 탄력 유지 중.")
     else:
-        lines.append(
-            f"📈 +{chg}% 상승 중, 이평선 수렴 또는 볼린저 상단 접근 — 모멘텀 강화 여부 주시."
-        )
+        lines.append(f"📈 +{chg:.1f}% 상승 중, 이평선 수렴 또는 볼린저 상단 접근 — 모멘텀 강화 여부 주시.")
 
-    # Conclusion
     if score >= 70:
         conclusion = f"종합 <strong>{score}점</strong> — 당일 상한가 진입 가능성 높음."
     elif score >= 50:
@@ -571,7 +527,7 @@ def generate_ai_opinion(row):
 def main():
     st.markdown('<p class="main-title">🔥 상한가 유력 종목 스크리너</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sub-title">KOSPI · KOSDAQ 실시간 기술적 분석 — 당일 상한가 도달 가능성 점수 산출</p>',
+        '<p class="sub-title">KOSPI · KOSDAQ 기술적 분석 — 당일 상한가 도달 가능성 점수 산출</p>',
         unsafe_allow_html=True,
     )
     st.markdown("""
@@ -582,17 +538,14 @@ def main():
     """, unsafe_allow_html=True)
 
     with st.sidebar:
-        st.markdown("### ⚙️ 스크리닝 설정")
+        st.markdown("### 설정")
         st.markdown("---")
         market_sel = st.selectbox("시장 선택", ["ALL (전체)", "KOSPI", "KOSDAQ"], index=0)
         market = "ALL" if "ALL" in market_sel else market_sel
-        min_cap = st.slider("최소 시가총액 (억)", 100, 2000, 500, step=100) * 100_000_000
-        max_cap = st.slider("최대 시가총액 (억)", 1000, 20000, 5000, step=500) * 100_000_000
-        min_turnover = st.slider("최소 거래대금 (억)", 10, 500, 100, step=10) * 100_000_000
         top_n = st.selectbox("상위 종목 수", [3, 5, 10], index=1)
         st.markdown("---")
+        st.caption(f"데이터: Yahoo Finance")
         st.caption(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        st.caption(f"기준 영업일: {get_trading_date()}")
         run_btn = st.button("🔍 분석 시작", use_container_width=True, type="primary")
 
     if "result_df" not in st.session_state:
@@ -606,17 +559,12 @@ def main():
                 pbar = st.progress(0)
             with c2:
                 stat = st.empty()
-            df_result = screen_stocks(
-                market=market,
-                min_cap=int(min_cap), max_cap=int(max_cap),
-                min_turnover=int(min_turnover),
-                progress_bar=pbar, status_text=stat,
-            )
+            df_result = screen_stocks(market=market, progress_bar=pbar, status_text=stat)
             pbar.empty()
             stat.empty()
 
         if df_result is None or df_result.empty:
-            st.info("조건을 만족하는 종목이 없습니다. 필터 조건을 완화해 보세요.")
+            st.info("조건을 만족하는 종목이 없습니다. 장중(09:00~15:30)에 실행해보세요.")
         else:
             st.session_state.result_df = df_result
 
@@ -625,7 +573,7 @@ def main():
         top_df = df.head(top_n).copy()
 
         st.markdown(f"#### 🏆 상한가 유력 상위 {top_n}개 종목")
-        display_cols = ["종목명", "시장", "현재가", "등락률(%)", "거래량", "거래대금(억)", "시가총액(억)", "상한가점수"]
+        display_cols = ["종목명", "시장", "현재가", "등락률(%)", "거래량", "시가총액(억)", "상한가점수"]
         st.dataframe(
             top_df[display_cols].style
             .background_gradient(subset=["상한가점수"], cmap="YlOrRd")
@@ -633,7 +581,6 @@ def main():
                 "현재가":      "{:,}",
                 "등락률(%)":   "{:+.2f}%",
                 "거래량":      "{:,}",
-                "거래대금(억)": "{:,.1f}",
                 "시가총액(억)": "{:,.0f}",
             }),
             use_container_width=True,
@@ -649,48 +596,38 @@ def main():
 
                 c1, c2, c3, c4 = st.columns(4)
                 with c1:
-                    st.markdown(f"""
-                    <div class="metric-card">
+                    st.markdown(f"""<div class="metric-card">
                         <div class="metric-label">현재가</div>
                         <div class="metric-value">{row['현재가']:,}원</div>
                     </div>""", unsafe_allow_html=True)
                 with c2:
                     cls = "metric-up" if row["등락률(%)"] >= 0 else "metric-dn"
-                    st.markdown(f"""
-                    <div class="metric-card">
-                        <div class="metric-label">등락률 (시가대비)</div>
+                    st.markdown(f"""<div class="metric-card">
+                        <div class="metric-label">등락률</div>
                         <div class="metric-value {cls}">{row['등락률(%)']:+.2f}%</div>
                     </div>""", unsafe_allow_html=True)
                 with c3:
-                    st.markdown(f"""
-                    <div class="metric-card">
-                        <div class="metric-label">거래대금</div>
-                        <div class="metric-value">{row['거래대금(억)']:.1f}억원</div>
+                    st.markdown(f"""<div class="metric-card">
+                        <div class="metric-label">거래량</div>
+                        <div class="metric-value">{row['거래량']:,}</div>
                     </div>""", unsafe_allow_html=True)
                 with c4:
                     color = "#f87171" if row["상한가점수"] >= 70 else \
                             "#fbbf24" if row["상한가점수"] >= 50 else "#93c5fd"
-                    st.markdown(f"""
-                    <div class="metric-card">
+                    st.markdown(f"""<div class="metric-card">
                         <div class="metric-label">상한가 점수</div>
-                        <div class="metric-value" style="color:{color}">
-                            {row['상한가점수']}점
-                        </div>
+                        <div class="metric-value" style="color:{color}">{row['상한가점수']}점</div>
                     </div>""", unsafe_allow_html=True)
 
-                # Score bar chart
-                detail = row.get("_score_detail", {})
+                detail  = row.get("_score_detail", {})
                 s_labels = [k for k in detail.keys() if k != "합계"]
                 s_vals   = [detail[k] for k in s_labels]
 
                 fig_score = go.Figure(go.Bar(
-                    x=s_labels, y=s_vals, text=s_vals,
-                    textposition="outside",
-                    marker=dict(
-                        color=s_vals,
-                        colorscale=[[0,"#1e3a5f"],[0.5,"#78350f"],[1,"#7f1d1d"]],
-                        cmin=0, cmax=25,
-                    ),
+                    x=s_labels, y=s_vals, text=s_vals, textposition="outside",
+                    marker=dict(color=s_vals,
+                                colorscale=[[0,"#1e3a5f"],[0.5,"#78350f"],[1,"#7f1d1d"]],
+                                cmin=0, cmax=25),
                 ))
                 fig_score.update_layout(
                     paper_bgcolor="#0a0e1a", plot_bgcolor="#0f1527",
@@ -723,6 +660,9 @@ def main():
             <div style="font-size:1.1rem; margin-top:1rem;">
                 사이드바에서 조건을 설정하고<br>
                 <strong style="color:#f97316;">분석 시작</strong> 버튼을 누르세요.
+            </div>
+            <div style="font-size:0.8rem; margin-top:0.8rem; color:#475569;">
+                장중(09:00~15:30) 실행 시 당일 데이터 반영
             </div>
         </div>
         """, unsafe_allow_html=True)
